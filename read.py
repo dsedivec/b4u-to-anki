@@ -1,15 +1,16 @@
 import codecs
+import io
 from datetime import datetime
 import os
+import os.path
 import struct
 import sys
+import argparse
+import re
+from HTMLParser import HTMLParser
+from StringIO import StringIO
+import htmlentitydefs
 
-#logfile = codecs.open('log.txt', encoding='utf-8', mode='a')
-#def log(s):
-#   s = unicode(s)
-#   print s.encode('ascii', 'ignore')
-#   logfile.write('\n' + s)
-#log('---- ' + str(datetime.now()) + ' -----------------')
 
 class Parser(object):
     struct_short = struct.Struct('<H')
@@ -208,7 +209,7 @@ class Deck(object):
                 break
 
         if caret is None:
-            return
+            raise Exception("bailing")
 
         deck_details_pointer = self.parser.read('L', 92)
         card_count = self.parser.read('L', caret +4)
@@ -288,13 +289,135 @@ class Deck(object):
         f.write(html)
         f.close()
 
+
+class HTMLStripper(HTMLParser):
+    def reset(self):
+        HTMLParser.reset(self)
+        self.data = StringIO()
+
+    def handle_data(self, data):
+        self.data.write(data)
+
+    def handle_charref(self, ref):
+        try:
+            if ref[0] == "x":
+                value = int(ref[1:], 16)
+            else:
+                value = int(ref)
+            self.data.write(unichr(value))
+        except:
+            print >>sys.stderr, "choked on charref %r" % (ref,)
+            raise
+
+    def handle_entityref(self, ref):
+        try:
+            return unichr(htmlentitydefs.name2codepoint[ref])
+        except:
+            print >>sys.stderr, "choked on entityref %r" % (ref,)
+            raise
+
+
+def strip_html(html):
+    stripper = HTMLStripper()
+    stripper.feed(html)
+    stripper.close()
+    return stripper.data.getvalue()
+
+
+class AnkiExporter(object):
+    def __init__(self, output_dir, delimiter, audio_extension_in_cards,
+                 should_strip_html):
+        self._output_dir = output_dir
+        self._delimiter = delimiter
+        self._audio_extension_in_cards = audio_extension_in_cards
+        self._should_strip_html = should_strip_html
+
+    def _process_card_text(self, text):
+        if self._should_strip_html:
+            text = strip_html(text)
+        text = text.strip()
+        return unicode(text)
+
+    def _get_text_for_side(self, card, side_name):
+        side_text = getattr(card, "%s_title" % (side_name,)) or ''
+        side_text = self._process_card_text(side_text)
+        subtitle = getattr(card, "%s_subtitle" % (side_name,))
+        if subtitle:
+            subtitle = self._process_card_text(subtitle)
+            if not subtitle.startswith("("):
+                subtitle = "(%s)" % (subtitle,)
+            side_text = "%s %s" % (side_text, subtitle)
+        return side_text
+
+    def _write_audio(self, card, side_name, side_text, first_native_word,
+                     base_name):
+        """Write out native/foreign audio, returns modified side_text."""
+        audio = getattr(card, "%s_audio" % (side_name,))
+        if isinstance(audio, Blob):
+            # Produces e.g. "Lesson01_0001_administrative_native".
+            audio_base_name = "%s_%04d_%s_%s" % (
+                base_name, card.number, first_native_word, side_name)
+            audio.write(os.path.join(self._output_dir,
+                                     audio_base_name + ".ogg"))
+            side_text = "%s [sound:%s.%s]" % (
+                side_text, audio_base_name, self._audio_extension_in_cards)
+        return side_text
+
+    def export(self, deck, base_name):
+        text_file_path = os.path.join(self._output_dir,
+                                      "%s.txt" % (base_name,))
+        text_file_obj = io.open(text_file_path, "wt", encoding="utf-8")
+        for card in deck.cards:
+            foreign_text = self._get_text_for_side(card, "foreign")
+            native_text = self._get_text_for_side(card, "native")
+            if native_text:
+                first_native_word = re.sub(r"[^\w]", "",
+                                           native_text.split()[0])
+            else:
+                first_native_word = ""
+            foreign_text = self._write_audio(card, "foreign", foreign_text,
+                                             first_native_word, base_name)
+            native_text = self._write_audio(card, "native", native_text,
+                                            first_native_word, base_name)
+            for attr in ("foreign_alt_answer", "native_alt_answer",
+                         "native_tooltip"):
+                value = getattr(card, attr)
+                if value:
+                    print "warning: discarding %s=%s on %s card" % (
+                        attr, value, native_text)
+            text_file_obj.write(self._delimiter.join([foreign_text,
+                                                      native_text]))
+            text_file_obj.write(u"\n")
+        text_file_obj.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("byki_file")
+    parser.add_argument("--output_dir", "-o", default="output")
+    parser.add_argument("--no-strip-html", dest="strip_html", default=True,
+                        action="store_false",
+                        help="Don't strip HTML from cards")
+    parser.add_argument("--delimiter", "-d", default="\t",
+                        help="Field delimiter (default: tab)")
+    parser.add_argument("--ogg", default=False, action="store_true",
+                        help=("Don't change sound file extensions"
+                              " from .ogg to .mp3 in cards"))
+    args = parser.parse_args()
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    elif not os.path.isdir(args.output_dir):
+        print >>sys.stderr, ("%r exists but is not a directory" %
+                             (args.output_dir,))
+        sys.exit(1)
+    deck = Deck(args.byki_file)
+    print "Will output to directory", args.output_dir
+    base_name = os.path.splitext(os.path.basename(args.byki_file))[0]
+    exporter = AnkiExporter(args.output_dir, args.delimiter,
+                            "ogg" if args.ogg else "mp3", args.strip_html)
+    exporter.export(deck, base_name)
+    print "Done"
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print 'Usage: readb4u.py [filename]'
-        sys.exit()
-
-    SCRIPT_DIR = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))
-    OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'output')
-
-    d = Deck(sys.argv[1])
-    d.html(OUTPUT_DIR)
+    main()
