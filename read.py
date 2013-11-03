@@ -310,6 +310,11 @@ class HTMLStripper(HTMLParser):
             raise
 
     def handle_entityref(self, ref):
+        # I can't really understand why this is not in htmlentitydefs.
+        # See if you can figure it out by reading, say,
+        # http://bugs.python.org/issue11113.
+        if ref == "apos":
+            return u"'"
         try:
             return unichr(htmlentitydefs.name2codepoint[ref])
         except:
